@@ -10,7 +10,10 @@ Env vars:
 from __future__ import annotations
 
 import os
+from typing import List
 from urllib.parse import urlparse
+
+from mosaicolabs import MosaicoClient, QueryResponse, QueryTopic
 
 
 def get_connect_kwargs() -> dict:
@@ -46,3 +49,20 @@ def _parse_url(url: str) -> tuple[str, int]:
         url = f"tcp://{url}"
     parsed = urlparse(url)
     return parsed.hostname or "localhost", parsed.port or 6276
+
+
+def discover_resources(connect_kwargs: dict) -> List[str]:
+    """Return list of 'sequence_name/topic_name' strings from the platform."""
+    resources: List[str] = []
+
+    with MosaicoClient.connect(**connect_kwargs) as sdk_client:
+        query = QueryTopic().with_name_match(".*")
+        results: QueryResponse = sdk_client.query(query)
+
+        for item in results:
+            for topic in item.topics:
+                handler = sdk_client.topic_handler(item.sequence.name, topic.name)
+                if handler:
+                    resources.append(f"{item.sequence.name}{topic.name}")
+
+    return resources
