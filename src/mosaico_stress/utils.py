@@ -116,20 +116,38 @@ def print_report(
     console.print()
 
     if verbose and metrics_bucket:
-        col_label = "Uploaded" if mode == "upload" else "Downloaded"
-        table = Table(title="Per-operation breakdown")
-        table.add_column("Client", style="cyan")
-        table.add_column(col_label, style="green")
-        table.add_column("Duration", style="yellow")
-        table.add_column("Throughput", style="magenta")
+        # Aggregate per-client stats
+        from collections import defaultdict
 
+        client_stats: dict = defaultdict(lambda: {"ops": 0, "bytes": 0, "durations": []})
         for op in metrics_bucket:
+            s = client_stats[op.client_id]
+            s["ops"] += 1
+            s["bytes"] += op.bytes_transferred
+            s["durations"].append(op.duration_seconds)
+
+        col_label = "Uploaded" if mode == "upload" else "Downloaded"
+        table = Table(title="Per-client summary")
+        table.add_column("Client", style="cyan")
+        table.add_column("Ops", style="white")
+        table.add_column(col_label, style="green")
+        table.add_column("Avg op time", style="yellow")
+        table.add_column("Avg throughput", style="magenta")
+
+        for cid in sorted(client_stats):
+            s = client_stats[cid]
+            total_mb = s["bytes"] / (1024 * 1024)
+            avg_dur = sum(s["durations"]) / len(s["durations"]) if s["durations"] else 0
+            total_dur = sum(s["durations"])
+            avg_tp = total_mb / total_dur if total_dur > 0 else 0
             table.add_row(
-                str(op.client_id),
-                f"{op.bytes_transferred / (1024 * 1024):.2f} MB",
-                f"{op.duration_seconds:.2f}s",
-                f"{op.throughput_mbs:.2f} MB/s",
+                str(cid),
+                str(s["ops"]),
+                f"{total_mb:.2f} MB",
+                f"{avg_dur:.3f}s",
+                f"{avg_tp:.2f} MB/s",
             )
+
         console.print(table)
 
 

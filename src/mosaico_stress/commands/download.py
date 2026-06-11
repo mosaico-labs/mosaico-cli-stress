@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import itertools
-import threading
+import multiprocessing
+import multiprocessing.synchronize
 import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional
+from multiprocessing import Event, Lock, Process, Value
+from typing import Any, List, Optional
 
 import typer
 from mosaicolabs import MosaicoClient
@@ -19,7 +20,6 @@ from mosaico_stress.utils import (
     parse_duration,
     parse_size,
     print_report,
-    size_limit_reached,
 )
 
 FLUSH_EVERY = 100
@@ -27,18 +27,20 @@ FLUSH_EVERY = 100
 def download_worker(
     client_id: int,
     resources: List[str],
-    shared_state: dict,
-    metrics_bucket: List[Operation],
+    stop_event: multiprocessing.synchronize.Event,
+    total_bytes: Any,
+    lock: multiprocessing.synchronize.Lock,
+    max_bytes: Optional[int],
     connect_kwargs: dict,
+    result_queue: multiprocessing.Queue,
 ) -> None:
     """Download topics in round-robin until the stop event fires."""
+    ops: List[dict] = []
+
     with MosaicoClient.connect(**connect_kwargs) as sdk_client:
         for resource in itertools.cycle(resources):
-            if shared_state["stop_event"].is_set():
+            if stop_event.is_set():
                 break
-
-            start_time = time.time()
-            bytes_received = 0
 
             sequence_name, topic_name = resource.split("/", 1)
             handler = sdk_client.topic_handler(sequence_name, topic_name)
@@ -49,37 +51,55 @@ def download_worker(
                 handler.timestamp_ns_min,
                 handler.timestamp_ns_max,
             )
+
+            batch_start = time.time()
+            batch_bytes = 0
             msg_count = 0
 
             for message in streamer:
-                bytes_received += len(message.model_dump_json())
+                batch_bytes += message._to_pa_record_batch().nbytes
                 msg_count += 1
 
                 if msg_count % FLUSH_EVERY == 0:
-                    if size_limit_reached(shared_state, bytes_received):
-                        shared_state["stop_event"].set()
+                    # Record batch operation
+                    batch_duration = time.time() - batch_start
+                    ops.append({
+                        "client_id": client_id,
+                        "duration_seconds": batch_duration,
+                        "bytes_transferred": batch_bytes,
+                        "throughput_mbs": (batch_bytes / (1024 * 1024)) / batch_duration if batch_duration > 0 else 0,
+                    })
+
+                    with lock:
+                        total_bytes.value += batch_bytes
+
+                    if max_bytes and total_bytes.value >= max_bytes:
+                        stop_event.set()
                         break
-                    if shared_state["stop_event"].is_set():
+                    if stop_event.is_set():
                         break
 
-            duration = time.time() - start_time
+                    # Reset for next batch
+                    batch_start = time.time()
+                    batch_bytes = 0
 
-            metrics_bucket.append(
-                Operation(
-                    client_id=client_id,
-                    duration_seconds=duration,
-                    bytes_transferred=bytes_received,
-                    throughput_mbs=(bytes_received / (1024 * 1024)) / duration if duration > 0 else 0,
-                )
-            )
+            # Flush remaining messages in partial batch
+            if batch_bytes > 0:
+                batch_duration = time.time() - batch_start
+                ops.append({
+                    "client_id": client_id,
+                    "duration_seconds": batch_duration,
+                    "bytes_transferred": batch_bytes,
+                    "throughput_mbs": (batch_bytes / (1024 * 1024)) / batch_duration if batch_duration > 0 else 0,
+                })
+                with lock:
+                    total_bytes.value += batch_bytes
 
-            with shared_state["lock"]:
-                shared_state["total_bytes"] += bytes_received
-
-            if size_limit_reached(shared_state):
-                shared_state["stop_event"].set()
+            if max_bytes and total_bytes.value >= max_bytes:
+                stop_event.set()
                 break
 
+    result_queue.put(ops)
 
 app = typer.Typer(invoke_without_command=True)
 
@@ -125,32 +145,51 @@ def download(
         console.print(f"  Target:   {connect_kwargs['host']}:{connect_kwargs['port']}")
         console.print()
 
-    stop_event = threading.Event()
-    shared_state = {
-        "total_bytes": 0,
-        "stop_event": stop_event,
-        "max_bytes": max_bytes,
-        "lock": threading.Lock(),
-    }
-    metrics_bucket: List[Operation] = []
+    # Shared state across processes
+    stop_event = Event()
+    total_bytes = Value("q", 0)
+    lock = Lock()
+    result_queue = multiprocessing.Queue()
 
-    def _timer():
-        stop_event.wait(timeout=max_seconds)
-        stop_event.set()
-
-    if max_seconds:
-        threading.Thread(target=_timer, daemon=True).start()
-
+    # Spawn worker processes
+    processes: List[Process] = []
     start = time.time()
 
-    with ThreadPoolExecutor(max_workers=client) as pool:
-        futures = [
-            pool.submit(download_worker, i, resources, shared_state, metrics_bucket, connect_kwargs)
-            for i in range(client)
-        ]
-        stop_event.wait()
-        for f in futures:
-            f.result()
+    for i in range(client):
+        p = Process(
+            target=download_worker,
+            args=(i, resources, stop_event, total_bytes, lock, max_bytes, connect_kwargs, result_queue),
+        )
+        p.start()
+        processes.append(p)
+
+    # Time limit watchdog
+    if max_seconds:
+        import threading
+
+        def _timer():
+            time.sleep(max_seconds)
+            stop_event.set()
+
+        threading.Thread(target=_timer, daemon=True).start()
+
+    # Wait for all workers to finish
+    for p in processes:
+        p.join()
 
     total_duration = time.time() - start
+
+    # Collect results from queue
+    metrics_bucket: List[Operation] = []
+    while not result_queue.empty():
+        ops = result_queue.get_nowait()
+        for op_dict in ops:
+            metrics_bucket.append(Operation(**op_dict))
+
+    shared_state = {
+        "total_bytes": total_bytes.value,
+        "max_bytes": max_bytes,
+        "lock": lock,
+    }
+
     print_report("download", total_duration, shared_state, metrics_bucket, client, verbose, output)

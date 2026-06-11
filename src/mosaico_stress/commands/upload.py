@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import multiprocessing
+import multiprocessing.synchronize
 import random
-import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional
+from multiprocessing import Event, Lock, Process, Value
+from typing import Any, List, Optional
 
 import typer
 from mosaicolabs import (
@@ -26,20 +27,23 @@ from mosaico_stress.utils import (
     parse_duration,
     parse_size,
     print_report,
-    size_limit_reached,
 )
 
-FLUSH_EVERY = 100
 BATCH_SIZE = 100
 
 def upload_worker(
     client_id: int,
-    shared_state: dict,
-    metrics_bucket: List[Operation],
+    stop_event: multiprocessing.synchronize.Event,
+    total_bytes: Any,
+    lock: multiprocessing.synchronize.Lock,
+    max_bytes: Optional[int],
     connect_kwargs: dict,
     sequence_prefix: str,
+    result_queue: multiprocessing.Queue,
 ) -> None:
     """Upload random IMU data until the stop event fires."""
+    ops: List[dict] = []
+
     with MosaicoClient.connect(**connect_kwargs) as sdk_client:
         seq_name = f"{sequence_prefix}_client{client_id}"
 
@@ -55,12 +59,12 @@ def upload_worker(
             )
 
             if not topic_writer:
+                result_queue.put(ops)
                 return
 
             ts_ns = 1_700_000_000_000_000_000
-            batch_count = 0
 
-            while not shared_state["stop_event"].is_set():
+            while not stop_event.is_set():
                 start_time = time.time()
                 bytes_sent = 0
 
@@ -82,26 +86,25 @@ def upload_worker(
                     )
                     topic_writer.push(message=msg)
                     ts_ns += 10_000_000
-                    bytes_sent += len(msg.model_dump_json())
+                    bytes_sent += msg._to_pa_record_batch().nbytes
 
                 duration = time.time() - start_time
-                batch_count += 1
 
-                metrics_bucket.append(
-                    Operation(
-                        client_id=client_id,
-                        duration_seconds=duration,
-                        bytes_transferred=bytes_sent,
-                        throughput_mbs=(bytes_sent / (1024 * 1024)) / duration if duration > 0 else 0,
-                    )
-                )
+                ops.append({
+                    "client_id": client_id,
+                    "duration_seconds": duration,
+                    "bytes_transferred": bytes_sent,
+                    "throughput_mbs": (bytes_sent / (1024 * 1024)) / duration if duration > 0 else 0,
+                })
 
-                with shared_state["lock"]:
-                    shared_state["total_bytes"] += bytes_sent
+                with lock:
+                    total_bytes.value += bytes_sent
 
-                if size_limit_reached(shared_state):
-                    shared_state["stop_event"].set()
+                if max_bytes and total_bytes.value >= max_bytes:
+                    stop_event.set()
                     break
+
+    result_queue.put(ops)
 
 
 def _cleanup_sequences(connect_kwargs: dict, sequence_prefix: str, num_clients: int) -> None:
@@ -116,7 +119,6 @@ def _cleanup_sequences(connect_kwargs: dict, sequence_prefix: str, num_clients: 
                     pass
     except Exception as e:
         error_console.print(f"[yellow]Warning:[/yellow] Cleanup failed: {e}")
-
 
 app = typer.Typer(invoke_without_command=True)
 
@@ -155,38 +157,53 @@ def upload(
         console.print(f"  Target:   {connect_kwargs['host']}:{connect_kwargs['port']}")
         console.print()
 
-    # Shared state — thread-safe via lock + Event
-    stop_event = threading.Event()
-    shared_state = {
-        "total_bytes": 0,
-        "stop_event": stop_event,
-        "max_bytes": max_bytes,
-        "lock": threading.Lock(),
-    }
-    metrics_bucket: List[Operation] = []
+    # Shared state across processes
+    stop_event = Event()
+    total_bytes = Value("q", 0)
+    lock = Lock()
+    result_queue = multiprocessing.Queue()
 
-    # Time limit watchdog
-    def _timer():
-        stop_event.wait(timeout=max_seconds)
-        stop_event.set()
-
-    if max_seconds:
-        timer_thread = threading.Thread(target=_timer, daemon=True)
-        timer_thread.start()
-
+    # Spawn worker processes
+    processes: List[Process] = []
     start = time.time()
 
-    with ThreadPoolExecutor(max_workers=client) as pool:
-        futures = [
-            pool.submit(upload_worker, i, shared_state, metrics_bucket, connect_kwargs, sequence_prefix)
-            for i in range(client)
-        ]
-        stop_event.wait()
+    for i in range(client):
+        p = Process(
+            target=upload_worker,
+            args=(i, stop_event, total_bytes, lock, max_bytes, connect_kwargs, sequence_prefix, result_queue),
+        )
+        p.start()
+        processes.append(p)
 
-        for f in futures:
-            f.result()
+    # Time limit watchdog (in main process)
+    if max_seconds:
+        import threading
+
+        def _timer():
+            time.sleep(max_seconds)
+            stop_event.set()
+
+        threading.Thread(target=_timer, daemon=True).start()
+
+    # Wait for all workers to finish
+    for p in processes:
+        p.join()
 
     total_duration = time.time() - start
+
+    # Collect results from queue
+    metrics_bucket: List[Operation] = []
+    while not result_queue.empty():
+        ops = result_queue.get_nowait()
+        for op_dict in ops:
+            metrics_bucket.append(Operation(**op_dict))
+
+    shared_state = {
+        "total_bytes": total_bytes.value,
+        "max_bytes": max_bytes,
+        "lock": lock,
+    }
+
     print_report("upload", total_duration, shared_state, metrics_bucket, client, verbose, output)
 
     # Cleanup
