@@ -1,0 +1,47 @@
+[tool.poetry]
+name = "mosaico-stress"
+version = "0.1.0-dev"
+description = "Stress test extension for the Mosaico CLI"
+authors = ["Mosaico Labs <info@mosaico.dev>"]
+readme = "README.md"
+license = "AGPL-3.0"
+keywords = [
+    "mosaicolabs",
+    "mosaico-stress",
+    "stress-test",
+    "benchmark",
+]
+
+packages = [{ include = "mosaico_stress", from = "src" }]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<4"
+typer = "^0.25.1"
+rich = ">=14.3.3,<16.0.0"
+mosaicolabs = { version = ">=0.1.0" }
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.4.2"
+ruff = "^0.15.8"
+
+[tool.poetry.scripts]
+mosaico-stress = "mosaico_stress.main:app"
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["COM812", "E501"]
+
+[tool.ruff.format]
+skip-magic-trailing-comma = false
+quote-style = "double"
+indent-style = "space"
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
